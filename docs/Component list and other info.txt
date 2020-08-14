@@ -1,0 +1,44 @@
+Components and other info:
+
+Arduino Mega 2560
+
+waterSondeController
+ - Arduino software
+ - Basic functionality:
+   1. Initializes the Arduino and connected probes on power up
+   2. Listens for commands from PC on USB serial connection if one is connected (see command list)
+   3. Takes electrical conductivity and temperature measurements
+   4. If measurement indicates certain salinity threshold has been crossed, opens solenoid valve (partially implemented)
+   5. Logs measurements to SD card
+   6. Sends measurement over cell network, probably by SMS or HTTP (not implemented yet - haven't been able to get example cell shield software to send SMS, only receive)
+   7. Signals TPL5110 timer to turn off power to everything. The TPL5110 timer will power everything back on after a certain interval, which is settable using an onboard potentiometer.
+
+Cell shield:
+ - Botletics SIM7000 shield
+ - https://github.com/botletics/SIM7000-LTE-Shield
+
+SIM card:
+ - Free hologram.io IoT SIM card
+ - Website: hologram.io
+ - username: brian.kardon@gmail.com
+ - password: sierraSonde14850
+
+Data logger:
+ - Velleman VMA202
+ - https://www.velleman.eu/products/view/?id=435508
+ - Designed for Arduino UNO
+ - Works with Mega 2560 with some added jumper wires
+
+EC sensor:
+ - Atlas Scientific EZO conductivity circuit
+ - https://www.atlas-scientific.com/product_pages/circuits/ezo_ec.html
+ - Requires voltage regulation and isolation
+
+Voltage regulator/isolator
+ - Atlas scientific basic EZO inline voltage isotor
+ - https://www.atlas-scientific.com/product_pages/circuits/basic-ezo.html
+
+Temp sensor:
+ - Atlas scientific RTD temperature circuit
+ - https://www.atlas-scientific.com/product_pages/circuits/ezo_rtd.html
+

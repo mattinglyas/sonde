@@ -320,6 +320,17 @@ void archiveDataFile(char * archiveFileName) {                      // Move data
 
 /* //////////////////////////////// SETTINGS //////////////////////////////// */
 
+/* Normal use settings: 
+settings currentSettings = {
+  false, // no sleeping
+  false, // no sample retrieved
+  true, // take a reading on boot and rely on the tpl5110 timer to fully power down arduino between readings
+  0, // no delay 
+  0, // no automatic measurements (if this is set to not zero, the arduino will busy wait using delay() instead of using the tpl5110)
+  1000 // sample duration
+};
+*/
+
 // Struct that holds a variety of settings that control the sonde's behavior
 settings currentSettings = {
   false,    // sleepEnabled
@@ -499,8 +510,27 @@ bool simNetStatus() {
   else return true;
 }
 
-bool connectToFTPServer() {
-  return connectToFTPServer(-1);
+void simPowerOnAndSetupLTE() {
+  Serial.println(F("ARD, Setting up SIM module"));
+
+  simPowerOn();
+  simModuleSetup();
+
+  // set modem to full functionality (LTE data)
+  fona.setFunctionality(1); //AT+CFUN=1
+  fona.setNetworkSettings(F("hologram"));
+
+  Serial.println(F("ARD,Connected to cell network!"));
+
+  // disable data connection before attempting to connect
+  fona.enableGPRS(false);
+
+  while (!fona.enableGPRS(true)) {
+    Serial.println(F("ARD,Failed to enable data, retrying..."));
+    delay(2000);
+  }
+
+  Serial.println(F("ARD,Enabled data connection"));
 }
 
 bool connectToFTPServer(int attempts) {
@@ -518,9 +548,14 @@ bool connectToFTPServer(int attempts) {
   return true;
 }
 
+bool connectToFTPServer() {
+  return connectToFTPServer(-1);
+}
+
 void disconnectFromFTPServer() {
-  if (!fona.FTP_Quit()) {
+  while (!fona.FTP_Quit()) {
     Serial.println(F("Error: Failed to close FTP connection!"));
+    delay(500);
   }
 }
 
@@ -735,7 +770,7 @@ void takeAndLogMeasurements() {
   resetMeasurement(&TEMPMeasurement);
   wakeTEMP();                                                     // Wake up TEMP in case it was sleeping
   wakeEC();                                                       // Wake up EC in case it was sleeping
-  measureTEMP();                                                  // Measure temperature TODO make get actual data
+  measureTEMP();                                                  // Measure temperature 
   Serial.print(F("Measured temp: ")); Serial.println(TEMPMeasurement.data);
   getTimestamp(TEMPMeasurement.timestamp);                        // Record timestamp when measurement was received
   updateTemperatureCompensation();                                // Update temperature compensation for EC
@@ -817,35 +852,35 @@ void logCommunication(String message) {             // Make a log of a communica
 }
 
 void logData(measurement * TEMPMeasurement, measurement * ECMeasurement, bool sampleRetrieved) {    // Log a measurement to the SD card
-  char dataEntry[128];
-
   // generate file name
   char timestamp[32];
   getTimestamp(timestamp);
 
   // organize log folders by timestamp to maintain 8.3 naming convention
   char ** splitString = strspl(timestamp, " ", 0); // timestamp is convieniently in YYYY/MM/DD HH:MM:SS format
-  char targetFolderName[64]; 
-  snprintf(targetFolderName, sizeof(targetFolderName), "%s%s/", dataFileFolder, splitString[0]); 
-
-  if (SD.mkdir(targetFolderName)) {
-    Serial.print(F("ARD,Creating or opening new folder at ")); Serial.println(targetFolderName);
-  } else {
-    char message[128];
-    snprintf(message, sizeof(message), "ARD,Could not create or open folder at %s", targetFolderName); 
-    Serial.println(message);
-    logError(message);
-    return;
-  }
+  char folderName[64]; 
+  char fileName[13];
+  snprintf(folderName, sizeof(folderName), "%s%s/", dataFileFolder, splitString[0]); 
 
   // format file name
-  replaceChar(splitString[1], ':', '-');
-  char targetFileName[64];
-  snprintf(targetFileName, sizeof(targetFileName), "%s%s.TXT", targetFolderName, splitString[1]);
+  snprintf(fileName, sizeof(fileName), "%s.TXT", splitString[1]);
+  replaceChar(fileName, ':', '-');
   
-  Serial.print(F("ARD,Writing to file name: ")); Serial.println(targetFileName);
+  free(splitString);
 
-  snprintf(dataEntry, sizeof(dataEntry), "MEASUREMENT,%s,%s,%s,%s,%u,%s,%s,%s,%s", 
+  if (SD.mkdir(folderName)) {
+    Serial.print(F("ARD,Creating or opening new folder at ")); Serial.println(folderName);
+  } else {
+    Serial.print(F("ARD,Could not create or open folder at ")); Serial.println(folderName); 
+  }
+
+  char completeFileName[64];
+  snprintf(completeFileName, sizeof(completeFileName), "%s%s", folderName, fileName);
+  
+  Serial.print(F("ARD,Writing to file name: ")); Serial.println(completeFileName);
+
+  char dataEntry[128];
+  snprintf(dataEntry, sizeof(dataEntry), /*"MEASUREMENT,*/"%s,%s,%s,%s,%u,%s,%s,%s,%s", 
     TEMPMeasurement->data, 
     TEMPMeasurement->timestamp, 
     ECMeasurement->data, 
@@ -857,19 +892,34 @@ void logData(measurement * TEMPMeasurement, measurement * ECMeasurement, bool sa
     ECMeasurement->lastPowerOff
     );
 
+  // store file in SD card
   if (SDConnected) {
-    openDataFile(&dataFile, targetFileName, FILE_WRITE);
+    openDataFile(&dataFile, completeFileName, FILE_WRITE);
     if (dataFile) {
-      dataFile.println(F("LOGTYPE,TEMPERATURE,TEMPERATURE_TIMESTAMP,SALINITY,SALINITY_TIMESTAMP,SAMPLE_RETRIEVED,TEMP_VOLTAGE,TEMP_LASTPOWEROFF,EC_VOLTAGE,EC_LASTPOWEROFF"));
+      //dataFile.println(F("TEMPERATURE,TEMPERATURE_TIMESTAMP,SALINITY,SALINITY_TIMESTAMP,SAMPLE_RETRIEVED,TEMP_VOLTAGE,TEMP_LASTPOWEROFF,EC_VOLTAGE,EC_LASTPOWEROFF"));
       dataFile.println(dataEntry);
       dataFile.flush();
       dataFile.close();
     }
   } else {
-      Serial.println(F("ARD,Failed to log data - SD card not connected"));
+    Serial.println(F("ARD,Failed to log data - SD card not connected"));
   }
 
-  free(splitString);
+  // upload file to FTP server
+  simPowerOnAndSetupLTE();
+  if (connectToFTPServer(5)) {
+
+    if (fona.FTP_PUT(fileName, folderName, dataEntry, strlen(dataEntry))) {
+      Serial.println(F("ARD,File uploaded to FTP server"));
+    } else {
+      Serial.println(F("ARD,Upload to FTP server failed!"));
+    }
+
+    // it looks like the message +FTPPUT: 1,0 closes the connection during the call to FTP_PUT above
+    //disconnectFromFTPServer();
+  }
+  fona.powerDown();
+
 }
 
 void logError(char * error) {    // Log an error to the SD card
@@ -885,7 +935,7 @@ void logError(char * error) {    // Log an error to the SD card
       logFile.print(milliseconds, DEC); logFile.print(F(",")); 
       logFile.print(timestamp); logFile.print(F(",")); 
       logFile.println(error);
-    logFile.close();
+      logFile.close();
     }
   } else {
     Serial.println(F("ARD,Failed to log error - SD card not connected"));
@@ -1035,26 +1085,10 @@ void setup() {
   setupSleepMode();
 
   /* SIM SETUP */
-  Serial.println(F("ARD, Setting up SIM module"));
 
-  simPowerOn();
-  simModuleSetup();
-
-  // set modem to full functionality (LTE data)
-  fona.setFunctionality(1); //AT+CFUN=1
-  fona.setNetworkSettings(F("hologram"));
-
-  Serial.println(F("ARD,Connected to cell network!"));
-
-  // disable data connection before attempting to connect
-  fona.enableGPRS(false);
-
-  while (!fona.enableGPRS(true)) {
-    Serial.println(F("ARD,Failed to enable data, retrying..."));
-    delay(2000);
-  }
-
-  Serial.println(F("ARD,Enabled data connection"));
+  // setup is done whenever the shield is needed to save power  
+  simPowerOnAndSetupLTE();
+  fona.powerDown();
 
   /* MISC SETUP */
 

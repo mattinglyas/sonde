@@ -1,4 +1,4 @@
-#define FTP_SERVER_IP "69.204.209.84"
+#define FTP_SERVER_IP ""
 #define FTP_SERVER_PORT 21
-#define FTP_USERNAME "amatti"
-#define FTP_PASSWORD "57165824"
+#define FTP_USERNAME ""
+#define FTP_PASSWORD ""

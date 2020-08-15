@@ -421,7 +421,7 @@ void simPowerOn() {
   digitalWrite(FONA_PWR_PIN, HIGH);
 }
 
-void simModuleSetup() {
+bool simModuleSetup() {
   // Note: The SIM7000A baud rate seems to reset after being power cycled (SIMCom firmware thing)
   // SIM7000 takes about 3s to turn on but SIM7500 takes about 15s
   // Press reset button if the module is still turning on and the board doesn't find it.
@@ -434,7 +434,7 @@ void simModuleSetup() {
   fonaSerial->begin(9600);
   if (!fona.begin(*fonaSerial)) {
     Serial.println(F("Couldn't find FONA"));
-    while(1); // Don't proceed if it couldn't find the device
+    return false; // Don't proceed if it couldn't find the device
   }
 
   // The commented block of code below is an alternative that will find the module at 115200
@@ -493,6 +493,8 @@ void simModuleSetup() {
 
   // Needed for rare cases in which firmware on SIM7000 sets CFUN to 0 on start-up
   fona.setFunctionality(1); // Enable cellular (RF) with AT+CFUN=1
+
+  return true;
 }
 
 bool simNetStatus() {
@@ -510,11 +512,11 @@ bool simNetStatus() {
   else return true;
 }
 
-void simPowerOnAndSetupLTE() {
+bool simPowerOnAndSetupLTE(int tries) {
   Serial.println(F("ARD, Setting up SIM module"));
 
   simPowerOn();
-  simModuleSetup();
+  if (!simModuleSetup()) return false;
 
   // set modem to full functionality (LTE data)
   fona.setFunctionality(1); //AT+CFUN=1
@@ -525,12 +527,21 @@ void simPowerOnAndSetupLTE() {
   // disable data connection before attempting to connect
   fona.enableGPRS(false);
 
-  while (!fona.enableGPRS(true)) {
+  int x = 0;
+  while (!fona.enableGPRS(true) && x > tries) {
     Serial.println(F("ARD,Failed to enable data, retrying..."));
     delay(2000);
+    x++;
   }
 
+  if (x == tries) return false;
+
   Serial.println(F("ARD,Enabled data connection"));
+  return true;
+}
+
+bool simPowerOnAndSetupLTE() {
+  return simPowerOnAndSetupLTE(5);
 }
 
 bool connectToFTPServer(int attempts) {
@@ -603,6 +614,7 @@ void getNextSignificantTEMPMessage(char * message, int maxLength) {             
     size_t nChar = Serial2.readBytesUntil('\r', message, maxLength);
     if (nChar > 0 && message[0] != '*') {
       message[nChar] = 0;
+      //Serial.print(message);
       break;   // This is not a response code (*OK, *WA, etc), it's a significant message.
     }
   }
@@ -613,6 +625,7 @@ void getNextSignificantECMessage(char * message, int maxLength) {               
     size_t nChar = Serial3.readBytesUntil('\r', message, maxLength);
     if (nChar > 0 && message[0] != '*') {
       message[nChar] = 0;
+      //Serial.print(message);
       break;   // This is not a response code (*OK, *WA, etc), it's a significant message.
     }
   }
@@ -647,8 +660,6 @@ void sleepEC() {                                   // Send a serial message to t
 }
 
 void measureTEMP() {                              // Instruct the TEMP sensor to take a measurement, and block until the measurement has been received from the TEMP sensor
-  wakeTEMP();
-  delay(1000);           // Give TEMP a chance to wake up
   Serial2.print(F("R\r"));                                                           // Request a measurement from TEMP probe
   getNextSignificantTEMPMessage(TEMPMeasurement.data, 32);
   //  size_t nChar = Serial2.readBytesUntil('\r', TEMPMeasurement.data, 32);                                   // Blocking read TEMP probe messages (expected: string rep of float)
@@ -657,8 +668,6 @@ void measureTEMP() {                              // Instruct the TEMP sensor to
 }
 
 void measureEC() {                                // Instruct the EC sensor to take a measurement, and block until the measurement has been received from the EC sensor
-  wakeEC();
-  delay(1000);           // Give EC a chance to wake up
   Serial3.print(F("R\r"));                                                           // Request a measurement from EC probe
   getNextSignificantECMessage(ECMeasurement.data, 32);
 //  size_t nChar = Serial3.readBytesUntil('\r', ECMeasurement.data, 32);                                     // Blocking read EC probe messages (expected: string rep of float)
@@ -667,6 +676,7 @@ void measureEC() {                                // Instruct the EC sensor to t
 }
 
 void updateTemperatureCompensation() {           // Send temperature measurement to the EC sensor to update its temperature compensation function that adjusts EC measurement to account for the effects of temperature.
+  if (strcmp(TEMPMeasurement.data, "-1023.000") == 0) return;
   Serial3.print(F("T,")); Serial3.print(TEMPMeasurement.data); Serial3.print('\r');  // Update conductivity probe temperature compensation
 //  discardNextECMessage();
 }
@@ -770,6 +780,7 @@ void takeAndLogMeasurements() {
   resetMeasurement(&TEMPMeasurement);
   wakeTEMP();                                                     // Wake up TEMP in case it was sleeping
   wakeEC();                                                       // Wake up EC in case it was sleeping
+  delay(1000);                                                    // Give devices time to wake up
   measureTEMP();                                                  // Measure temperature 
   Serial.print(F("Measured temp: ")); Serial.println(TEMPMeasurement.data);
   getTimestamp(TEMPMeasurement.timestamp);                        // Record timestamp when measurement was received
@@ -906,8 +917,7 @@ void logData(measurement * TEMPMeasurement, measurement * ECMeasurement, bool sa
   }
 
   // upload file to FTP server
-  simPowerOnAndSetupLTE();
-  if (connectToFTPServer(5)) {
+  if (simPowerOnAndSetupLTE() && connectToFTPServer(5)) {
 
     if (fona.FTP_PUT(fileName, folderName, dataEntry, strlen(dataEntry))) {
       Serial.println(F("ARD,File uploaded to FTP server"));
@@ -1055,19 +1065,25 @@ void setup() {
 
   /* PROBE SETUP */
 
-  Serial.println(F("ARD,Setting up probes"));
+  //Serial.println(F("ARD,Setting up probes"));
 
-  enableECProbe(false);
+  //enableECProbe(false);
   enableECProbe(true);
 
   // wake both sensors
   wakeTEMP();
   wakeEC();
 
-  // disable continuous reading and wait a second for that to register:
+  delay(200);
+
+  // disable continuous reading (if it wasn't set already) and wait a second for that to register:
   Serial2.print(F("C,0\r"));
   Serial3.print(F("C,0\r"));
-  delay(1000);
+  delay(200);
+
+  // TODO for some reason the first TEMP reading on power on reports "-1023.000"
+  //   reading and discarding the first measurement made by the TEMP probe seems to work
+  measureTEMP();
 
   Serial.println(F("ARD,Putting probes to sleep"));
   sleepTEMP();
@@ -1087,8 +1103,9 @@ void setup() {
   /* SIM SETUP */
 
   // setup is done whenever the shield is needed to save power  
-  simPowerOnAndSetupLTE();
-  fona.powerDown();
+  // any time the shield is needed, simPowerOnAndSetupLTE() is called. No need to start shield here
+  //simPowerOnAndSetupLTE();
+  //fona.powerDown();
 
   /* MISC SETUP */
 
@@ -1423,5 +1440,7 @@ void loop() {
         delay(500); // There's a message incoming. Wait for rest of message to come in so we don't go to sleep between character transmissions
       }
     }
+  } else {
+    delay(500); // busy wait if sleep is not enabled
   }
 }

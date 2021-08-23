@@ -5,21 +5,24 @@
 #include <avr/sleep.h>
 #include <avr/wdt.h>
 #include <Wire.h>
+#include <CRC32.h>
 #include "Adafruit_FONA.h"
 #include "SD.h"
 #include "Config.h"
-#include "WaterSondeTypeDefs.h"
+#include "WaterSondeTypedefs.h"
 #include "RTClib.h"
+#include "measurement.h"
+#include "input.h"
 
 /* //////////////////////////////// PIN DEFINITIONS //////////////////////////////// */
 
 #define INTERRUPT_PIN 2
 #define FONA_PWR_PIN 6
 #define FONA_RST_PIN 7
-#define LED_PIN 13
+#define LED_PIN 13             // This is tied to digital 52
 #define EC_ENABLE_PIN 32
 #define READY_TO_SLEEP_PIN 33
-#define SOLENOID_VALVE_PIN 34
+#define SOLENOID_VALVE_PIN 35
 
 // On the Ethernet Shield, CS is pin 4. Note that even if it's not
 // used as the CS pin, the hardware CS pin (10 on most Arduino boards,
@@ -29,7 +32,7 @@
 
 /* ////////////////////////////////  UTILITIES //////////////////////////////// */
 
-char ** strspl(char * inputString, char * delim, int splitNum) {                    // Split string into array of strings on delimiters
+char **strspl(char *inputString, const char *delim, int splitNum) {                 // Split string into array of strings on delimiters
     int i;
     if (splitNum == 0) {                                                            // splitNum is zero - split on all delimiters
         for (i=0, splitNum=0; inputString[i]; i++) {                                // Iterate over list until we reach the null terminator
@@ -37,7 +40,7 @@ char ** strspl(char * inputString, char * delim, int splitNum) {                
         } 
     }
     char ** splitString = NULL;                                                     // Instantiate an array of pointers to strings to hold split parts of inputString
-    splitString = malloc((splitNum+2)*sizeof(char *));                              // Allocate memory for array of pointers. Don't forget to free memory afterwards
+    splitString = (char **) malloc((splitNum+2)*sizeof(char *));                    // Allocate memory for array of pointers. Don't forget to free memory afterwards
     i = 0;
     for (char *p = strtok(inputString, delim); (i < splitNum+1) && p; i++) {        // split up inputString and assign parts to splitString
         splitString[i] = p;
@@ -81,9 +84,9 @@ void blinkCountdown(unsigned long intervalSize, int numIntervals, unsigned long 
 }
 
 // some log methods are used before logging section so header must be declared early
-void logError(char * error);
-void logEvent(char * eventDescription);
-void logData(measurement * TEMPMeasurement, measurement * ECMeasurement, bool sampleRetrieved);
+void logError(char *error);
+void logEvent(char *eventDescription);
+void logData(Measurement *TEMPMeasurement, Measurement *ECMeasurement, bool sampleRetrieved);
 
 /* //////////////////////////////// RTC, TIME, AND SLEEP //////////////////////////////// */
 
@@ -121,18 +124,6 @@ void setupSleepMode() {                                                 // Set u
   delay(100); //Allow for serial print to complete.
 }
 
-void goToSleep() {                                                      // Settings various things to reduce power use by Arduino
-  Serial.println(F("Going to sleep..."));
-  delay(200);
-  attachInterrupt(0, INTERRUPT_PIN, LOW);
-  set_sleep_mode(SLEEP_MODE_IDLE);
-  sleep_enable();
-  sleep_mode();
-  sleep_disable();
-  power_adc_disable();        // Disable Analog/digital converter
-  Serial.println(F("Waking up!"));
-}
-
 void pin2Interrupt(void) {                                            // Set up sleep interrupt pin
   /* This will bring us back from sleep. */
    /* We detach the interrupt to stop it from 
@@ -140,6 +131,18 @@ void pin2Interrupt(void) {                                            // Set up 
    * is low.
    */
   detachInterrupt(0);
+}
+
+void goToSleep() {                                                      // Settings various things to reduce power use by Arduino
+  Serial.println(F("Going to sleep..."));
+  delay(200);
+  attachInterrupt(digitalPinToInterrupt(INTERRUPT_PIN), pin2Interrupt, LOW);
+  set_sleep_mode(SLEEP_MODE_IDLE);
+  sleep_enable();
+  sleep_mode();
+  sleep_disable();
+  power_adc_disable();        // Disable Analog/digital converter
+  Serial.println(F("Waking up!"));
 }
 
 void goLowPower() {         // Reduce power usage by setting unused analog outs to digital mode, and set to low output
@@ -215,8 +218,8 @@ void powerDown() {                                            // Give a blink-co
 }
 
 void getTimestamp(char * timestamp) {                             // Write a timestamp to the provided string pointer
-    DateTime now = rtc.now();
-    snprintf(timestamp, 32, "%04d/%02d/%02d %02d:%02d:%02d", now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second());
+  DateTime now = rtc.now();
+  snprintf(timestamp, 32, "%04d/%02d/%02d %02d:%02d:%02d", now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second());
 }
 
 void connectToRTC() {                             // Connect to real time clock on data logger shield
@@ -251,6 +254,7 @@ void connectToSDCard() {                                // Open conection to dat
   pinMode(SS, OUTPUT);                                // make sure that the default chip select pin is set to output, even if you don't use it:
   SDConnected = false;
   int attempts = 5;
+  
   while (!SDConnected && attempts > 0) {
     if (!SD.begin(CS_PIN, 11, 12, 13)) {
       attempts--;
@@ -262,27 +266,25 @@ void connectToSDCard() {                                // Open conection to dat
       SDConnected = true;  
     }
   }
-  if (!SD.begin(CS_PIN, 11, 12, 13)) {            // see if the card is present and can be initialized, using correct SD pins:
-  } else {
-  }
+  
   Serial.flush();
 }
 
-void openDataFile(File * file, char * filename, byte mode) {            // Create/open for writing a file with the name given by argument. If argument is null string "", use default stored in variable dataFileName
+void openDataFile(File * file, const char * filename, byte mode) {            // Create/open for writing a file with the name given by argument. If argument is null string "", use default stored in variable dataFileName
   if (file) {
-    (*file).close();
+    file->close();
   }
   char message[128];
   if (!filename[0]) {
     filename = dataFileName;
   }
   if (*file) {                                  // If file is already open, close it
-    (*file).close();
+    file->close();
   }
   *file = SD.open(filename, mode);              // Attempt to open file
   if (!(*file)) {                               // If file fails to open, try creating it by opening it in write mode
     *file = SD.open(filename, FILE_WRITE);      // Create file
-    (*file).close();
+    file->close();
     *file = SD.open(filename, mode);            // Attempt to reopen file
   }
   if (!(*file)) {
@@ -291,30 +293,6 @@ void openDataFile(File * file, char * filename, byte mode) {            // Creat
   } else {
 //    sprintf(message, "Opened file: %s", filename);
 //    Serial.println(message);
-  }
-}
-
-void archiveDataFile(char * archiveFileName) {                      // Move data from current default data file to new file with given name, then delete default data file and recreate it blank.
-  char message[128];
-  if (!logFile) {
-    openDataFile(&logFile, dataFileName, FILE_READ);           // If it isn't already open, open default data file
-  }
-  File archiveFile;
-  openDataFile(&archiveFile, archiveFileName, FILE_WRITE);       // Open archive file
-  if (logFile && archiveFile) {
-    char nextChar;
-    while (true) {                                   // Copy default data file contents into archive file
-      nextChar = logFile.read();
-      if (nextChar != -1) {
-        archiveFile.write(nextChar);
-      }
-    }
-    logFile.close();                                // Close default data file
-    archiveFile.close();                             // Close archive data file
-    SD.remove(dataFileName);                         // Remove existing default data file
-  } else {
-      snprintf(message, 128, "Archive - could not open datafile: %s or %s", dataFileName, archiveFileName);
-      logError(message);
   }
 }
 
@@ -333,22 +311,30 @@ settings currentSettings = {
 
 // Struct that holds a variety of settings that control the sonde's behavior
 settings currentSettings = {
-  false,    // sleepEnabled
-  false,    // sampleRetrieved
-  false,     // singleShotMeasurementOnBootMode
-  1234UL,     // singleShotMeasurementDelay
+  false,      // sleepEnabled
+  false,      // sampleRetrieved
+  true,       // singleShotMeasurementOnBootMode
+  5000UL,     // singleShotMeasurementDelay
   0UL,        // measurementInterval
-  2345        // sampleDuration
+  45000,      // sampleDuration
+  0,          // measurementFailureCount
+  3,          // sampleFailureThreshold
+  740.0,      // measurementFailureThreshold
+  0           // crc
 };
 
 // Default settings to fall back on
 settings defaultSettings = {
-  false,    // sleepEnabled
-  false,    // sampleRetrieved
-  false,     // singleShotMeasurementOnBootMode
+  false,      // sleepEnabled
+  false,      // sampleRetrieved
+  true,       // singleShotMeasurementOnBootMode
   5000UL,     // singleShotMeasurementDelay
   0UL,        // measurementInterval
-  0       // sampleDuration
+  45000,      // sampleDuration
+  0,          // measurementFailureCount
+  3,          // sampleFailureThreshold
+  740.0,      // measurementFailureThreshold
+  0           // crc
 };
 
 void settingsToBytes(settings * sIn, byte * bufOut) {         // Convert a settings struct to a byte array so it can be saved to the SD card
@@ -376,6 +362,9 @@ void printCurrentSettings() {                                 // Send the curren
     Serial.print(F("singleShotMeasurementDelay: ")); Serial.println(currentSettings.singleShotMeasurementDelay);
     Serial.print(F("measurementInterval: ")); Serial.println(currentSettings.measurementInterval);
     Serial.print(F("sampleDuration: ")); Serial.println(currentSettings.sampleDuration);
+    Serial.print(F("measurementFailureCount: ")); Serial.println(currentSettings.measurementFailureCount);
+    Serial.print(F("sampleFailureThreshold: ")); Serial.println(currentSettings.sampleFailureThreshold);
+    Serial.print(F("measurementFailureThreshold: ")); Serial.println(currentSettings.measurementFailureThreshold);
     Serial.println(F("*******************************************"));
 }
 
@@ -497,21 +486,6 @@ bool simModuleSetup() {
   return true;
 }
 
-bool simNetStatus() {
-  int n = fona.getNetworkStatus();
-  
-  Serial.print(F("Network status ")); Serial.print(n); Serial.print(F(": "));
-  if (n == 0) Serial.println(F("Not registered"));
-  if (n == 1) Serial.println(F("Registered (home)"));
-  if (n == 2) Serial.println(F("Not registered (searching)"));
-  if (n == 3) Serial.println(F("Denied"));
-  if (n == 4) Serial.println(F("Unknown"));
-  if (n == 5) Serial.println(F("Registered roaming"));
-
-  if (!(n == 1 || n == 5)) return false;
-  else return true;
-}
-
 bool simPowerOnAndSetupLTE(int tries) {
   Serial.println(F("ARD, Setting up SIM module"));
 
@@ -534,7 +508,8 @@ bool simPowerOnAndSetupLTE(int tries) {
     x++;
   }
 
-  if (x == tries) return false;
+  if (x == tries)
+    return false;
 
   Serial.println(F("ARD,Enabled data connection"));
   return true;
@@ -576,34 +551,14 @@ bool measurementInProgress = false;                             // Is an automat
 bool singleShotMeasurementComplete = false;                     // Flag to set when the single shot measurement has already been taken
 
 // Structs used to collect and store measurement data from EC and TEMP probes
-measurement ECMeasurement; 
-measurement TEMPMeasurement; 
+Measurement ECMeasurement; 
+Measurement TEMPMeasurement; 
 
 // Structs to collect messages received from PC, EC probe and TEMP probes as they arrive.
-serialInput PCInput =   {"", 0, false};
-serialInput SIMInput = {"", 0, false};
-serialInput ECInput =   {"", 0, false};
-serialInput TEMPInput = {"", 0, false};
-
-void resetMeasurement (measurement * m) {                               // Reset a measurement struct back to zeros
-  (*m).data[0] = 0;
-  (*m).timestamp[0] = 0;
-  (*m).voltage[0] = 0;
-  (*m).lastPowerOff[0] = 0;
-}
-
-void zeroString(char * string) {
-  for (int k = 0; string[k]; k++) {
-    string[k] = 0;
-  }
-}
-
-void resetInput (serialInput * input) {                                 // Reset an input struct back to empty values
-  (*input).messageComplete = false;
-  (*input).inputStringLoc = 0;
-  (*input).inputString[0] = "\0";
-  zeroString((*input).inputString);
-}
+cInput PCInput(Serial);
+cInput SIMInput(Serial1);
+cInput TEMPInput(Serial2);
+cInput ECInput(Serial3);
 
 void enableECProbe(bool enable) {   // Enable or disable EC probe
   digitalWrite(EC_ENABLE_PIN, (enable ? HIGH : LOW));
@@ -756,28 +711,52 @@ void setContinuousMeasurements(unsigned long interval) {  //3600000          // 
     Serial.println(message);
   }
   if (!currentSettings.measurementInterval) {                  // Continuous measurements are currently off
-    resetMeasurement(&ECMeasurement);
-    resetMeasurement(&TEMPMeasurement);
+    ECMeasurement.reset();
+    TEMPMeasurement.reset();
   }
 }
 
 bool isItSampleTime(char * salinity) {                        // Check if it's time to take a sample or not based on the measured electrical conductivity (not implemented yet)
+  // TODO: so, first things first, we need to parse the salinity value into an actual float.  This should be
+  // taking place elsewhere, but for now its here.
+  double sv = atof(salinity);
+  if(sv == 0.0) {
+    Serial.println(F("Potentially malformed salinity value, aborting sample check."));
+    return false;
+  }
+  
+  // Check if measurement fails salinity test, updating only if a sample can be taken
+  if((sv >= currentSettings.measurementFailureThreshold) && currentSettings.sampleRetrieved == false) {
+    // Measurement has exceeded threshold...
+    if(currentSettings.measurementFailureCount < currentSettings.sampleFailureThreshold) {
+      currentSettings.measurementFailureCount++;
+    } else {
+      // We've exceeded the failed measurement threshold, it is indeed time to take a sample
+      return true;
+    }
+  }
   return false;
 }
 
-void retrieveSample(int milliseconds) {                       // Open the solenoid valve for a certain amount of time to retrieve a sample
+void retrieveSample(unsigned int milliseconds) {     // Open the solenoid valve for a certain amount of time to retrieve a sample
   // Open solenoid valve for the given # of milliseconds.
   // This is a blocking function
   digitalWrite(SOLENOID_VALVE_PIN, HIGH);   // Open solenoid valve
-  delay(milliseconds);                    // Keep it open for some amount of time while the water enters the sample chamber
+  delay(milliseconds);                      // Keep it open for some amount of time while the water enters the sample chamber
   digitalWrite(SOLENOID_VALVE_PIN, LOW);    // Close solenoid valve
   currentSettings.sampleRetrieved = true;
   saveCurrentSettingsToDisk();
+
+  // TODO: arguably, this is not the ideal place for this, but its workable...
+  simPowerOnAndSetupLTE();
+  fona.sendSMS("+16073462556", "The Sonde has captured a sample!");   // Bill
+  fona.sendSMS("+16082343996", "The Sonde has captured a sample!");   // Dick
+  fona.powerDown();
 }
 
 void takeAndLogMeasurements() {
-  resetMeasurement(&ECMeasurement);                               // Reset measurement tracking variables, just in case
-  resetMeasurement(&TEMPMeasurement);
+  ECMeasurement.reset();                                          // Reset measurement tracking variables, just in case
+  TEMPMeasurement.reset();
   wakeTEMP();                                                     // Wake up TEMP in case it was sleeping
   wakeEC();                                                       // Wake up EC in case it was sleeping
   delay(1000);                                                    // Give devices time to wake up
@@ -791,24 +770,18 @@ void takeAndLogMeasurements() {
   getTEMPStatus();                                                // Record TEMP device status
   getECStatus();                                                  // Record EC device status
   if (isItSampleTime(ECMeasurement.data)) {                       // Conductivity indicates we should take a sample, and we haven't taken one yet!
-    retrieveSample(currentSettings.sampleDuration);                                             // Take a sample!
+    retrieveSample(currentSettings.sampleDuration);               // Take a sample!
   }
 
   Serial.println(F("Saving to SD Card"));
   logData(&TEMPMeasurement, &ECMeasurement, currentSettings.sampleRetrieved);     // Log data to SD card
-  resetMeasurement(&ECMeasurement);                               // Reset measurement tracking variables
-  resetMeasurement(&TEMPMeasurement);
+  ECMeasurement.reset();                                          // Reset measurement tracking variables
+  TEMPMeasurement.reset();
   sleepTEMP();
   sleepEC();  
 }
 
 /* //////////////////////////////// LOGGING AND DEBUG //////////////////////////////// */
-
-char inChar;
-const int targetCommandLength = 32;
-char target[targetCommandLength];
-char command[targetCommandLength];
-char * commandName;
 
 void logBootEvent() {                                         // Log some status info to the SD card
   if (SDConnected) {
@@ -819,8 +792,8 @@ void logBootEvent() {                                         // Log some status
     wakeTEMP();                                                     // Wake up TEMP in case it was sleeping
     wakeEC();                                                       // Wake up EC in case it was sleeping
 
-    resetMeasurement(&ECMeasurement);
-    resetMeasurement(&TEMPMeasurement);
+    ECMeasurement.reset();
+    TEMPMeasurement.reset();
     getTEMPStatus();
     getECStatus();
 
@@ -843,32 +816,13 @@ void logBootEvent() {                                         // Log some status
   }
 }
 
-void logCommunication(String message) {             // Make a log of a communication? Not sure what I was planning to use this for.
-  if (SDConnected) {
-    unsigned long milliseconds = millis();
-    char timestamp[32];
-    getTimestamp(timestamp);
-  
-    openDataFile(&logFile, dataFileName, FILE_WRITE);
-    logFile.println(F("LOGTYPE,TIME_MS,TIMESTAMP,MESSAGE"));
-      logFile.print(F("COMMUNICATION,"));
-      logFile.print(milliseconds, DEC); logFile.print(F(","));
-      logFile.print(timestamp); logFile.print(F(","));
-      logFile.println(message);
-    logFile.flush();
-    logFile.close();
-  } else {
-      Serial.println(F("ARD,Failed to log communication - SD card not connected"));
-  }
-}
-
-void logData(measurement * TEMPMeasurement, measurement * ECMeasurement, bool sampleRetrieved) {    // Log a measurement to the SD card
+void logData(Measurement * TEMPMeasurement, Measurement * ECMeasurement, bool sampleRetrieved) {    // Log a measurement to the SD card
   // generate file name
   char timestamp[32];
   getTimestamp(timestamp);
 
   // organize log folders by timestamp to maintain 8.3 naming convention
-  char ** splitString = strspl(timestamp, " ", 0); // timestamp is convieniently in YYYY/MM/DD HH:MM:SS format
+  char **splitString = strspl(timestamp, " ", 0); // timestamp is convieniently in YYYY/MM/DD HH:MM:SS format
   char folderName[64]; 
   char fileName[13];
   snprintf(folderName, sizeof(folderName), "%s%s/", dataFileFolder, splitString[0]); 
@@ -900,8 +854,7 @@ void logData(measurement * TEMPMeasurement, measurement * ECMeasurement, bool sa
     TEMPMeasurement->voltage, 
     TEMPMeasurement->lastPowerOff, 
     ECMeasurement->voltage, 
-    ECMeasurement->lastPowerOff
-    );
+    ECMeasurement->lastPowerOff);
 
   // store file in SD card
   if (SDConnected) {
@@ -929,7 +882,6 @@ void logData(measurement * TEMPMeasurement, measurement * ECMeasurement, bool sa
     //disconnectFromFTPServer();
   }
   fona.powerDown();
-
 }
 
 void logError(char * error) {    // Log an error to the SD card
@@ -1004,7 +956,7 @@ void getCurrentDataFileContents() {                                // Dump entir
       }
       logFile.close();
     } else {
-      return "ERROR: No data file loaded";
+      return;
     }
   } else {
     Serial.println(F("ARD,Failed to get data file contents - SD card not connected"));
@@ -1022,24 +974,26 @@ void measureECDebug() {
 /* //////////////////////////////// ARDUINO SKETCH //////////////////////////////// */
 
 void setup() {
-  Serial.begin(9600); // open USB connection to PC
-  Serial2.begin(9600); // open SPI connection to TEMP probe
-  Serial3.begin(9600); // open SPI connection to EC probe
+  Serial.begin(9600);               // open USB connection to PC
+  Serial2.begin(9600);              // open SPI connection to TEMP probe
+  Serial3.begin(9600);              // open SPI connection to EC probe
     
-  while (Serial.available()) {          // Flush incoming buffer from PC
+  while (Serial.available()) {      // Flush incoming buffer from PC
     Serial.read();
   }
 
-  while (Serial2.available()) {         // Flush incoming buffer from EC
-    Serial.read();
+  while (Serial2.available()) {     // Flush incoming buffer from EC
+    Serial2.read();
   }
 
-  while (Serial3.available()) {         // Flush incoming buffer from TEMP
-    Serial.read();
+  while (Serial3.available()) {     // Flush incoming buffer from TEMP
+    Serial3.read();
   }
 
+  // Enable echo on PC port
+  PCInput.enableEcho();
+  
   /* PIN SETUP */
-
   pinMode(LED_PIN, OUTPUT);
   pinMode(FONA_RST_PIN, OUTPUT);
   pinMode(FONA_PWR_PIN, OUTPUT);
@@ -1056,7 +1010,6 @@ void setup() {
   digitalWrite(SOLENOID_VALVE_PIN, LOW);
 
   /* SD SETUP */
-
   Serial.println(F("ARD,Setting up SD card"));
 
   connectToSDCard();
@@ -1064,16 +1017,11 @@ void setup() {
   printCurrentSettings();
 
   /* PROBE SETUP */
-
-  //Serial.println(F("ARD,Setting up probes"));
-
-  //enableECProbe(false);
   enableECProbe(true);
 
   // wake both sensors
   wakeTEMP();
   wakeEC();
-
   delay(200);
 
   // disable continuous reading (if it wasn't set already) and wait a second for that to register:
@@ -1090,43 +1038,314 @@ void setup() {
   sleepEC();
 
   /* RTC SETUP */
-
   Serial.println(F("ARD,Setting up RTC"));
   connectToRTC();
 
   /* SLEEP SETUP */
-  
   // Set up watchdog timer and interrupt pin to be ready for sleeping
   Serial.println(F("ARD,Setting up sleep mode"));
   setupSleepMode();
 
-  /* SIM SETUP */
-
-  // setup is done whenever the shield is needed to save power  
-  // any time the shield is needed, simPowerOnAndSetupLTE() is called. No need to start shield here
-  //simPowerOnAndSetupLTE();
-  //fona.powerDown();
-
-  /* MISC SETUP */
-
   Serial.println(F("ARD,Setup complete"));
 }
 
-// Loop workflow:
-// 1. If continuous recording is enabled, execute blocking commands to collect and log data.
-// 2. If single shot measurement mode is on, and measurement is already complete, signal ready to shut down. Otherwise, take a measurement.
-// 3. Check for PC commands
-// 4. Check for messages from temp probe
-// 5. Check for messages from EC probe
-// 6. If PC commands exist, execute them
-// 7. If EC messages exist, relay them to PC
-// 8. If Temp messages exist, relay them to PC
+/*
+ * Handle sampler commands
+ */
+void cmd_handleSampler(char *cmds) {
+  char *tail = cmds;
+  char *command;
+
+  /* Split off command name */
+  command = strtok_r(tail, ",", &tail);
+  Serial.print("cmd ["); Serial.print(command); Serial.print("] tail ["); Serial.print(tail); Serial.println("]");
+
+  if(strcmp(command, "SAMPLE") == 0) {
+    /* Accepted commands:
+     * SAMPLE,1  -  Perform sample collection, and save status.
+     * SAMPLE,0  -  Mark sample as not taken, and save status.
+     * SAMPLE,?  -  Display current sample status
+     */
+    if(strcmp(tail, "1") == 0) {
+      Serial.println(F("SAMP,Retrieving sample..."));
+      retrieveSample(currentSettings.sampleDuration);
+      Serial.println(F("SAMP,...sample retrieved!"));
+    } else if(strcmp(tail, "0") == 0) {
+      currentSettings.sampleRetrieved = false;
+      saveCurrentSettingsToDisk();
+      Serial.println(F("SAMP,Sample record reset"));
+    } else if(strcmp(tail, "?") == 0) {
+      Serial.print(F("SAMP,Sample retrieved: "));
+      Serial.println(tail ? F("Yes") : F("No"));
+    } else {
+      Serial.print(F("SAMP,ERROR - unrecognized error for SAMPLE command: ")), Serial.println(tail);
+    }
+  } else if(strcmp(command, "VALVE") == 0) {
+    /* Accepted commands:
+     * VALVE,0  -  Manually turn valve solenoid off.
+     * VALVE,1  -  Manually turn valve solenoid on.
+     */
+    if(strcmp(tail, "0") == 0) {
+      Serial.println(F("SAMP,Closing sample valve"));
+      digitalWrite(SOLENOID_VALVE_PIN, LOW);
+    } else if(strcmp(tail, "1") == 0) {
+      Serial.println(F("SAMP,Opening valve. WARNING: Leaving valve open will draw a large amount of current from the valve battery. It is recommended that you do not leave the valve open for more than a few seconds."));
+      digitalWrite(SOLENOID_VALVE_PIN, HIGH);
+    }
+  } else if(strcmp(command, "DURATION") == 0) {
+    /* Accepted commands:
+     * DURATION,[new value in ms]
+     */
+    char *ptr;
+    unsigned long newSampleDuration = strtoul(tail, &ptr, 10);
+    if (newSampleDuration) {
+      currentSettings.sampleDuration = newSampleDuration;
+      saveCurrentSettingsToDisk();
+    } else {
+      Serial.print(F("SAMP,Error: invalid sample duration: ")); Serial.println(tail);
+    }
+  } else if(strcmp(command, "REARM") == 0) {
+    /* Accepted commands:
+     * REARM  -  Resets EC failure counter and marks sample as not retrieved.
+     *
+     * This resets the failure counter and sets sampleRetrieved to false, effecitvely 
+     * re-arming the sampler. Intended to be used after physically swapping sample containers.
+     */
+    currentSettings.measurementFailureCount = 0;
+    currentSettings.sampleRetrieved = false;
+    saveCurrentSettingsToDisk();
+  } else {
+    Serial.print(F("SAMP,ERROR: command not recognized: ")); Serial.println(command);
+  }
+}
+
+/*
+ * Handle Arduino (system) commands
+ */
+void cmd_handleArduino(char *cmds) {
+  char *tail = cmds;
+  char *command;
+
+  /* Split off command name */
+  command = strtok_r(tail, ",", &tail);
+  Serial.print("cmd ["); Serial.print(command); Serial.print("] tail ["); Serial.print(tail); Serial.println("]");
+
+  if(strcmp(command, "SENDTIME") == 0) {
+    /* Accepted commands:
+     * SENDTIME  -  Report currently set time.  TODO: Unimplimented!
+     */
+    Serial.println(F("ARD,REQUEST_TIME"));
+  } else if(strcmp(command, "DEFAULTS") == 0) {
+    /* Accepted commands:
+     * DEFAULTS  -  Reset system settings back to compiled-in defaults.
+     */
+    Serial.println(F("ARD,Restoring all settings to defaults."));
+    saveDefaultSettingsToDisk();
+    retrieveSettingsFromDisk();
+  } else if(strcmp(command, "DUMPDATA") == 0) {
+    /* Accepted commands:
+     * DUMPDATA  -  Write contents of current datafile out to PC host
+     */
+    Serial.println(F("Received command DUMPDATA"));
+    Serial.println(F("**** BEGIN FILE CONTENTS ****"));
+    getCurrentDataFileContents();
+    Serial.println(F("****  END FILE CONTENTS  ****"));
+  } else if(strcmp(command, "STARTFILE") == 0) {
+    /* Accepted commands:
+     * STARTFILE  -  TODO: unimplemented, intention unclear.
+     */
+    Serial.print(F("ARD,STARTFILE not implemented yet"));
+  } else if(strcmp(command, "CLEARDATA") == 0) {
+    /* Accepted commands:
+     * CLEARDATA  -  Remove current datafile
+     */
+    SD.remove((char *) dataFileName);
+    Serial.print(F("ARD,Cleared data file"));
+  } else if(strcmp(command, "MILLIS") == 0) {
+    /* Accepted commands:
+     * MILLIS  -  Report back current Arduino tick counter (essentially, system uptime)
+     */
+    char strMillis[16];
+    snprintf(strMillis, 16, "%lu", millis());
+    Serial.print(F("ARD,")); Serial.println(strMillis);
+  } else if(strcmp(command, "PWRDOWN") == 0) {
+    /* Accepted commands:
+     * PWRDOWN  -  Signal system to power down.
+     * 
+     * Ironically this can't really work, because if this message is received, that implies
+     * that USB is connected, and timer isn't controlling power, so it can't power down.
+     */
+    powerDown();
+  } else if(strcmp(command, "C") == 0) {
+    /* Accepted commands:
+     * C,?              -  Check continuous measurement setting.
+     * C,[value in ms]  -  Set new value for continuous measurement.
+     */
+    if(strcmp(tail, "?") == 0) {
+      Serial.print(F("ARD,DATA_INTERVAL="));
+      Serial.println(currentSettings.measurementInterval, DEC);
+    } else {
+      char *ptr;
+      setContinuousMeasurements(strtol(tail, &ptr, 10));    // TODO: conversion failure needs to be handled.
+    }
+  } else if(strcmp(command, "M") == 0) {
+    /* Accepted commands:
+     * M  -  Take a measurement and log it.
+     */
+    Serial.println(F("ARD,Beginning measurement..."));
+    takeAndLogMeasurements();
+    Serial.println(F("ARD,...measurement complete and logged"));
+  } else if(strcmp(command, "SSM") == 0) {
+    /* Accepted commands:
+     * SSM,?  -  Check current single shot measurement mode value.
+     * SSM,1  -  Enable
+     * SSM,0  -  Disable
+     */
+    if(strcmp(tail, "?") == 0) {
+      Serial.print(F("ARD,SSM=")); Serial.println(currentSettings.singleShotMeasurementOnBootMode ? 1 : 0, DEC);
+    } else {
+      char *ptr;
+
+      // TODO: same as previous strtol instance above, though this call could be avoided entirely.
+      currentSettings.singleShotMeasurementOnBootMode = (strtol(tail, &ptr, 10) == 1);
+      saveCurrentSettingsToDisk();
+      Serial.print(F("ARD,Setting SSM to "));
+      Serial.println(currentSettings.singleShotMeasurementOnBootMode, DEC);
+    }
+  } else if(strcmp(command, "SSMDELAY") == 0) {
+    /* Accepted commands:
+     * SSMDELAY,?                  -  Show current single-shot delay value.
+     * SSMDELAY,[new value in ms]  -  Set single shot delay value.
+     */
+    if(strcmp(tail, "?") == 0) {
+      Serial.print(F("ARD,SSMDELAY="));
+      Serial.println(currentSettings.singleShotMeasurementDelay);
+    } else {
+      char *ptr;
+      int newSingleShotMeasurementDelay = strtol(tail, &ptr, 10);
+      if(newSingleShotMeasurementDelay) {
+        currentSettings.singleShotMeasurementDelay = newSingleShotMeasurementDelay;
+        saveCurrentSettingsToDisk();
+        Serial.print(F("ARD,Setting single shot measurement delay to "));
+        Serial.println(currentSettings.singleShotMeasurementDelay);
+      } else {
+        Serial.print(F("ARD,Error: invalid single shot measurement delay value: "));
+        Serial.println(tail);
+      }
+    }
+  } else if(strcmp(command, "CONNECT") == 0) {
+    /* Accepted commands:
+     * CONNECT  -  TODO: Unimplemented and intention unknown
+     */
+    Serial.print(F("ARD,CONNECT not implemented yet"));
+  } else if(strcmp(command, "TIMESTAMP") == 0) {
+    /* Accepted commands:
+     * TIMESTAMP,?               -  Show currently set time
+     * TIMESTAMP,S,[m,d,y,h,m,s] -  Set new rtc time
+     * 
+     * TODO: This system has other clock sources, like cell network time.  Would be
+     * nice to be able to sync our local rtc to that.
+     */
+    //const unsigned char maxMessageLength = 128;
+    //char message[maxMessageLength];
+
+    if(strcmp(tail, "?") == 0) {
+      char timestamp[64];
+      getTimestamp(timestamp);
+      Serial.print(F("ARD,TIME=")); Serial.println(timestamp);
+    } else if(strcmp(tail, "S") == 0) {
+      /*
+      int splitStringCount;
+
+      for(splitStringCount = 0; splitString[splitStringCount]; splitStringCount++) {}   // Count the # of strings in splitString
+      
+      Serial.println(splitStringCount);
+      if(splitStringCount < 7) {
+        Serial.println(F("ARD,Error: Not enough arguments for TIMESTAMP,S command"));
+      } else {
+        char *ptr;
+        int dateVals[6];
+
+        for(int i = 0; i < 6; i++) {
+          dateVals[i] = strtol(splitString[i+2], &ptr, 10);
+          Serial.println(dateVals[i], DEC);
+        }
+
+        rtc.adjust(DateTime(dateVals[0], dateVals[1], dateVals[2], dateVals[3], dateVals[4], dateVals[5]));
+        snprintf(message, maxMessageLength, "ARD,Set date: %02d/%02d/%02d %02d:%02d:%02d", dateVals[0], dateVals[1], dateVals[2], dateVals[3], dateVals[4], dateVals[5]);
+        Serial.println(message);
+        logEvent(message);
+        message[0] = 0;
+      }
+      */
+    }
+  } else if(strcmp(command, "NOTE") == 0) {
+    /* Accepted commands:
+     * NOTE,[text]  -  Adds a freeform line of text to the current log datafile.
+     */
+    logNote(tail);
+  } else if(strcmp(command, "EC_SLEEP") == 0) {
+    /* Accepted commands:
+     * EC_SLEEP  -  Instructs EC sensor to go to sleep.
+     */
+    Serial.println(F("ARD,Goodnight, EC probe"));
+    sleepEC();
+  } else if(strcmp(command, "TEMP_SLEEP") == 0) {
+    /* Accepted commands:
+     * TEMP_SLEEP  -  Instructs temperature sensor to go to sleep.
+     */
+    Serial.println(F("ARD,Goodnight, TEMP probe"));
+    sleepTEMP();
+  } else if (strcmp(command, "ARD_SLEEP") == 0) {
+    /* Accepted commands:
+     * ARD_SLEEP,0  -  Sets Arduino sleep mode off.
+     * ARD_SLEEP,1  -  Sets Arduino sleep mode on.
+     * ARD_SLEEP,?  -  Show current sleep mode.
+     */
+    if (strcmp(tail, "0") == 0) {
+      Serial.println(F("ARD,Sleep mode off"));
+      currentSettings.sleepEnabled = false;
+      saveCurrentSettingsToDisk();
+    } else if (strcmp(tail, "1") == 0) {
+      Serial.println(F("ARD,Sleep mode on"));
+      currentSettings.sleepEnabled = true;
+      saveCurrentSettingsToDisk();
+    } else if (strcmp(tail, "?") == 0) {
+      Serial.print(F("ARD,Sleep mode: ")); Serial.println((currentSettings.sleepEnabled ? "On" : "Off"));
+    } else {
+      Serial.print(F("ARD,Sleep command not recognized: ")); Serial.println(tail);
+    }
+  } else if (strcmp(command, "PRINTSETTINGS") == 0) {
+    /* Accepted commands:
+     * PRINTSETTINGS  -  Show current system settings.
+     */
+    Serial.println(F("ARD,Current settings:"));
+    printCurrentSettings();
+  } else {
+    Serial.print(F("ARD,Error: command not recognized: ")); Serial.println(command);
+  }
+}
+
+const int targetCommandLength = 32;
+char target[targetCommandLength];
+char command[targetCommandLength];
+char *commandName;
+
+/* Loop workflow:
+ * 1. If continuous recording is enabled, execute blocking commands to collect and log data.
+ * 2. If single shot measurement mode is on, and measurement is already complete, signal ready
+ *    to shut down. Otherwise, take a measurement.
+ * 3. Check for PC commands
+ * 4. Check for messages from temp probe
+ * 5. Check for messages from EC probe
+ * 6. If PC commands exist, execute them
+ * 7. If EC messages exist, relay them to PC
+ * 8. If Temp messages exist, relay them to PC
+ */
 void loop() {
-  int maxMessageLength  = 128;
-  char message[maxMessageLength];
-  if (currentSettings.measurementInterval) {               // If we are in automatic measurement mode...
-    long currentTime = millis();
-    if (currentTime > nextMeasureTime) {                                                      // Check if the desired time interval has passed for taking measurements
+  if(currentSettings.measurementInterval) {      // If we are in automatic measurement mode...
+    unsigned long currentTime = millis();
+    if(currentTime > nextMeasureTime) {          // Check if the desired time interval has passed for taking measurements
       Serial.println(F("ARD,Beginning automatic measurement..."));
       takeAndLogMeasurements();
       Serial.println(F("ARD,...automatic measurement complete!"));
@@ -1134,9 +1353,10 @@ void loop() {
     }
   }
 
-  if (currentSettings.singleShotMeasurementOnBootMode && millis() > currentSettings.singleShotMeasurementDelay) {  // Are we in wake ==> measurement ==> power down mode? And has the delay passed?
-    if (singleShotMeasurementComplete) {                                            // Single shot measurement is complete
-      if (!Serial.available() && !Serial2.available() && !Serial3.available()) {    // We're not waiting on any serial messages, then signal readiness to power down
+  if(currentSettings.singleShotMeasurementOnBootMode && millis() > currentSettings.singleShotMeasurementDelay) {  // Are we in wake ==> measurement ==> power down mode? And has the delay passed?
+    if(singleShotMeasurementComplete) {                                            // Single shot measurement is complete
+      if(!Serial.available() && !Serial2.available() && !Serial3.available()) {    // We're not waiting on any serial messages, then signal readiness to power down
+        saveCurrentSettingsToDisk();
         powerDown();   // Signal the low power chip that we're ready to power down
       } else {
         Serial.println(F("Waiting for serial messages to finish coming in, can't power down yet..."));
@@ -1149,291 +1369,65 @@ void loop() {
     }
   }
 
-  if (Serial.available()) {      // Read messages from PC, if any
-    while (!PCInput.messageComplete) {
-      if (Serial.available()) {
-        inChar = (char)Serial.read();                   // Read 1 char of serial data
-//        Serial.print("|"); Serial.print(inChar); Serial.println("|");
-        PCInput.messageBegun = true;
-      } else {break;}                                   // No data in pipe, end serial read loop
-      if (PCInput.inputStringLoc == 0 && inChar == ',') {  // We're detecting a initial dummy wake character - ignore it.
-        // Do nothing
-      } else if (inChar == '\n' || inChar == '\r') {           // Check if character is a line end character
-        PCInput.messageComplete = true;                 // Set flag that message is complete
-        PCInput.messageBegun = false;
-        PCInput.inputString[PCInput.inputStringLoc] = 0;  // Null terminate string
-      } else {
-        PCInput.inputString[PCInput.inputStringLoc] = inChar;   // Add new character to the inputString at the append string index
-        PCInput.inputStringLoc++;                               // Increment the append string index for the next character
-      }
-      if (PCInput.messageComplete) {
-        Serial.println(F("PC msg complete:"));
-        Serial.println(PCInput.inputString);
-        char ** splitString = strspl(PCInput.inputString, ",", 1);   // Message is complete! Split it into its CSV parts
-        strcpy(target, splitString[0]);
-        strcpy(command, splitString[1]);           // First CSV component is the command target, rest is the command
-        Serial.println(target);
-        Serial.println(command);
-        free(splitString);                              // Free allocated memory for splitString
-      }
-    }
-  }
+  /* Read pending data from sensor serial lines if available and append to respective message buffers */
+  PCInput.update();
+  SIMInput.update();
+  TEMPInput.update();
+  ECInput.update();
+  
+  if(PCInput.messageComplete) {                           // Execute command received from PC
+    Serial.print(F("PC msg complete: ["));
+    Serial.print(PCInput.inputString);
+    Serial.print("]  recieved ");
+    Serial.println(PCInput.inputStringLoc);
 
-  if (Serial1.available()) {    // Read messages from SIM7000 modem, if any
-    while (true) {
-      if (Serial1.available()) {
-        inChar = (char)Serial1.read();                   // Read 1 char of serial data
-//        Serial.println(inChar);
-        SIMInput.messageBegun = true;
-      } else {break;}                                   // No data in pipe, end serial read loop
-      if (inChar == '\n' || inChar == '\r') {           // Check if character is a line end character
-        SIMInput.messageComplete = true;                 // Set flag that message is complete
-        SIMInput.messageBegun = false;
-        SIMInput.inputString[SIMInput.inputStringLoc] = 0;  // Null terminate string
-      } else {
-        SIMInput.inputString[SIMInput.inputStringLoc] = inChar;   // Add new character to the inputString at the append string index
-        SIMInput.inputStringLoc++;                               // Increment the append string index for the next character
-      }
-    }
-  }
+    char *tail = PCInput.inputString;
+    char *tgt;
 
-  if (Serial2.available()) {    // Read messages from temp probe, if any
-    while (true) {
-      if (Serial2.available()) {
-        inChar = (char)Serial2.read();                   // Read 1 char of serial data
-//        Serial.println("Recieved TEMP char:");
-//        Serial.println(inChar);
-        TEMPInput.messageBegun = true;
-      } else {break;}                                   // No data in pipe, end serial read loop
-      if (inChar == '\n' || inChar == '\r') {           // Check if character is a line end character
-        TEMPInput.messageComplete = true;                 // Set flag that message is complete
-        TEMPInput.messageBegun = false;
-        TEMPInput.inputString[TEMPInput.inputStringLoc] = 0;  // Null terminate string
-      } else {
-        TEMPInput.inputString[TEMPInput.inputStringLoc] = inChar;   // Add new character to the inputString at the append string index
-        TEMPInput.inputStringLoc++;                               // Increment the append string index for the next character
-      }
-    }
-  }
+    /* Split off command name */
+    tgt = strtok_r(tail, ",", &tail);
 
-  if (Serial3.available()) {      // Read messages from EC probe, if any
-    while (true) {
-      if (Serial3.available()) {
-        inChar = (char)Serial3.read();                   // Read 1 char of serial data
-        ECInput.messageBegun = true;
-      } else {break;}                                   // No data in pipe, end serial read loop
-      if (inChar == '\n' || inChar == '\r') {           // Check if character is a line end character
-        ECInput.messageComplete = true;                 // Set flag that message is complete
-        ECInput.messageBegun = false;
-        ECInput.inputString[ECInput.inputStringLoc] = 0;  // Null terminate string
-      } else {
-        ECInput.inputString[ECInput.inputStringLoc] = inChar;   // Add new character to the inputString at the append string index
-        ECInput.inputStringLoc++;                               // Increment the append string index for the next character
-      }
-    }
-  }
-
-  if (PCInput.messageComplete) {               // Execute command received from PC
-    if (strcmp(target, "EC") == 0) {       // Command is targeted to conductivity probe
-        Serial3.print(command); Serial3.print('\r');
-    } else if (strcmp(target, "TEMP") == 0) {    // Command is targeted to temperature probe
+    if(strcmp(tgt, "EC") == 0) {                       // Command is targeted to conductivity probe
+        Serial3.print(tail);
+        Serial3.print('\r');
+    } else if(strcmp(tgt, "TEMP") == 0) {              // Command is targeted to temperature probe
         Serial.println(F("Sending command to TEMP:"));
-        Serial.println(command);
-        Serial2.print(command); Serial2.print('\r');
+        Serial.println(tail);
+        Serial2.print(tail);
+        Serial2.print('\r');
         Serial.println(F("...done sending command to TEMP!"));
-    } else if (strcmp(target, "SAMP") == 0) {    // Command is targeted to water sampler
-        char ** splitString = strspl(command, ",", 0);   // Message is complete! Split it into its CSV parts
-        commandName = splitString[0];
-        if (strcmp(commandName, "SAMPLE") == 0) {
-          if (strcmp(splitString[1], "1") == 0) {
-            Serial.println(F("SAMP,Retrieving sample..."));
-            retrieveSample(currentSettings.sampleDuration);
-            Serial.println(F("SAMP,...sample retrieved!"));
-          } else if (strcmp(splitString[1], "0") == 0) {
-            currentSettings.sampleRetrieved = false;
-            saveCurrentSettingsToDisk();
-            Serial.println(F("SAMP,Sample record reset"));
-          } else if (strcmp(splitString[1], "?") == 0) {
-            Serial.print(F("SAMP,Sample retrieved: ")); Serial.println(splitString[1] ? F("Yes") : F("No"));
-          } else {
-            Serial.print(F("SAMP,ERROR - unrecognized error for SAMPLE command: ")), Serial.println(splitString[1]);
-          }
-        } else if (strcmp(commandName, "VALVE") == 0) {
-          if (strcmp(splitString[1], "0") == 0) {
-            Serial.println(F("SAMP,Closing sample valve"));
-            digitalWrite(SOLENOID_VALVE_PIN, LOW);   // Close solenoid valve
-          } else if (strcmp(splitString[1], "1") == 0) {
-            Serial.println(F("SAMP,Opening valve. WARNING: Leaving valve open will draw a large amount of current from the valve battery. It is recommended that you do not leave the valve open for more than a few seconds."));
-            digitalWrite(SOLENOID_VALVE_PIN, HIGH);   // Open solenoid valve
-          }
-        } else if (strcmp(commandName, "DURATION") == 0) {
-          char * ptr;
-          int newSampleDuration = strtol(splitString[1], &ptr, 10);
-          if (newSampleDuration) {
-            currentSettings.sampleDuration = (int) newSampleDuration;
-            saveCurrentSettingsToDisk();
-          } else {
-            Serial.print(F("SAMP,Error: invalid sample duration: ")); Serial.println(splitString[1]);
-          }
-        } else {
-          Serial.print(F("SAMP,ERROR: command not recognized: ")); Serial.println(commandName);
-        }
-    } else if (strcmp(target, "ARD") == 0) {     // Command is targeted to arduino
-        char ** splitString = strspl(command, ",", 0);   // Message is complete! Split it into its CSV parts
-        commandName = splitString[0];
-      if (strcmp(commandName, "SENDTIME") == 0) {
-        Serial.println(F("ARD,REQUEST_TIME"));
-      } else if (strcmp(commandName, "DEFAULTS") == 0) {
-        Serial.println(F("ARD,Restoring all settings to defaults."));
-        saveDefaultSettingsToDisk();
-        retrieveSettingsFromDisk();
-      } else if (strcmp(commandName, "DUMPDATA") == 0) {
-        Serial.println(F("Received command DUMPDATA"));
-        Serial.println(F("**** BEGIN FILE CONTENTS ****"));
-        getCurrentDataFileContents();
-        Serial.println(F("****  END FILE CONTENTS  ****"));
-      } else if (strcmp(commandName, "STARTFILE") == 0) {
-        Serial.print(F("ARD,STARTFILE not implemented yet"));
-      } else if (strcmp(commandName, "CLEARDATA") == 0) {
-        SD.remove(dataFileName);
-        Serial.print(F("ARD,Cleared data file"));
-      } else if (strcmp(commandName, "MILLIS") == 0) {
-        char strMillis[16];
-        snprintf(strMillis, 16, "%lu", millis());
-        Serial.print(F("ARD,")); Serial.println(strMillis);
-      } else if (strcmp(commandName, "PWRDOWN") == 0) {
-        // Signal for power down. Ironically this can't really work, because if this message is received, then USB is connected, and timer isn't controlling power, so it can't power down. 
-        powerDown();
-      } else if (strcmp(commandName, "C") == 0) {
-        if (strcmp(splitString[1], "?") == 0) {            // Check continuous measurement setting
-          Serial.print(F("ARD,DATA_INTERVAL=")); Serial.println(currentSettings.measurementInterval, DEC);
-        } else {
-          char *ptr;
-          setContinuousMeasurements(strtol(splitString[1], &ptr, 10));
-        }
-      } else if (strcmp(commandName, "M") == 0) {
-        Serial.println(F("ARD,Beginning measurement..."));
-        takeAndLogMeasurements();
-        Serial.println(F("ARD,...measurement complete and logged"));
-      } else if (strcmp(commandName, "SSM") == 0) {
-        if (strcmp(splitString[1], "?") == 0) {            // Check single shot measurement mode
-          Serial.print(F("ARD,SSM=")); Serial.println(currentSettings.singleShotMeasurementOnBootMode ? 1 : 0, DEC);
-        } else {
-          char * ptr;
-          currentSettings.singleShotMeasurementOnBootMode = (strtol(splitString[1], &ptr, 10) == 1);
-          saveCurrentSettingsToDisk();
-          Serial.print(F("ARD,Setting SSM to ")); Serial.println(currentSettings.singleShotMeasurementOnBootMode, DEC);
-        }
-      } else if (strcmp(commandName, "SSMDELAY") == 0) {
-        char * ptr;
-        int newSingleShotMeasurementDelay = strtol(splitString[1], &ptr, 10);
-        if (newSingleShotMeasurementDelay) {
-          currentSettings.singleShotMeasurementDelay = newSingleShotMeasurementDelay;
-          saveCurrentSettingsToDisk();
-          Serial.print(F("ARD,Setting single shot measurement delay to ")); Serial.println(currentSettings.singleShotMeasurementDelay);
-        } else {
-          Serial.print(F("ARD,Error: invalid single shot measurement delay value: ")); Serial.println(splitString[1]);
-        }
-      } else if (strcmp(commandName, "CONNECT") == 0) {
-          Serial.print(F("ARD,CONNECT not implemented yet"));
-      } else if (strcmp(commandName, "TIMESTAMP") == 0) {  // Log timestamp from PC
-        if (strcmp(splitString[1], "?") == 0) {
-          char timestamp[64];
-          getTimestamp(timestamp);
-          Serial.print(F("ARD,TIME=")); Serial.println(timestamp);
-        } else if (strcmp(splitString[1], "S") == 0) {
-          int splitStringCount;
-          for (splitStringCount = 0; splitString[splitStringCount]; splitStringCount++) {   // Count the # of strings in splitString
-          }
-          Serial.println(splitStringCount);
-          if (splitStringCount < 7) {
-            Serial.println(F("ARD,Error: Not enough arguments for TIMESTAMP,S command"));
-          } else {
-            char * ptr;
-            int dateVals [6];
-            for (int i = 0; i < 6; i++) {
-              dateVals[i] = strtol(splitString[i+2], &ptr, 10);
-              Serial.println(dateVals[i], DEC);
-            }
-            rtc.adjust(DateTime(dateVals[0], dateVals[1], dateVals[2], dateVals[3], dateVals[4], dateVals[5]));
-            snprintf(message, maxMessageLength, "ARD,Set date: %02d/%02d/%02d %02d:%02d:%02d", dateVals[0], dateVals[1], dateVals[2], dateVals[3], dateVals[4], dateVals[5]);
-            Serial.println(message);
-            logEvent(message);
-            message[0] = 0;
-          }
-        }
-      } else if (strcmp(commandName, "NOTE") == 0) {
-        logNote(splitString[1]);
-//      } else if (strcmp(commandName, "") == 0) {
-      } else if (strcmp(commandName, "EC_SLEEP") == 0) {
-        Serial.println(F("ARD,Goodnight, EC probe"));
-        sleepEC();
-      } else if (strcmp(commandName, "TEMP_SLEEP") == 0) {
-        Serial.println(F("ARD,Goodnight, TEMP probe"));
-        sleepTEMP();
-      } else if (strcmp(commandName, "ARD_SLEEP") == 0) {
-        if (strcmp(splitString[1], "0") == 0) {
-          Serial.println(F("ARD,Sleep mode off"));
-          currentSettings.sleepEnabled = false;
-          saveCurrentSettingsToDisk();
-        } else if (strcmp(splitString[1], "1") == 0) {
-          Serial.println(F("ARD,Sleep mode on"));
-          currentSettings.sleepEnabled = true;
-          saveCurrentSettingsToDisk();
-        } else if (strcmp(splitString[1], "?") == 0) {
-          Serial.print(F("ARD,Sleep mode: ")); Serial.println((currentSettings.sleepEnabled ? "On" : "Off"));
-        } else {
-          Serial.print(F("ARD,Sleep command not recognized: ")); Serial.println(splitString[1]);
-        }
-      } else if (strcmp(commandName, "PRINTSETTINGS") == 0) {
-        Serial.println(F("ARD,Current settings:"));
-        printCurrentSettings();
-      } else {
-        Serial.print(F("ARD,Error: command not recognized: ")); Serial.println(commandName);
-      }
-      free(splitString);
+    } else if(strcmp(tgt, "SAMP") == 0) {              // Command is targeted to water sampler
+      cmd_handleSampler(tail);
+    } else if (strcmp(tgt, "ARD") == 0) {              // Command is targeted to arduino
+      cmd_handleArduino(tail);
     } else {
-      Serial.print(F("ARD,Error: target not recognized: ")); Serial.println(target);
+      Serial.print(F("ARD,Error: target not recognized: ")); Serial.println(tgt);
     }
-    resetInput(&PCInput);
+    PCInput.reset();
   }
 
-  if (SIMInput.messageComplete) {             // Relay message received from SIM7000 modem
-    Serial.print(F("SIM,")); Serial.println(SIMInput.inputString);
-    Serial.flush();
-    resetInput(&SIMInput);
-  }
+  //if(SIMInput.messageComplete) {             // Relay message received from SIM7000 modem
+//    Serial.print(F("SIM,")); Serial.println(SIMInput.inputString);
+    //Serial.flush();
+    //SIMInput.reset();
+  //}
 
-  if (TEMPInput.messageComplete) {             // Relay message received from TEMP probe
+  if(TEMPInput.messageComplete) {             // Relay message received from TEMP probe
     Serial.print(F("TEMP,")); Serial.println(TEMPInput.inputString);
     Serial.flush();
-//    if (TEMPMeasurement.waitingForData) {
-////      char *ptr;
-////      TEMPMeasurement.data = strtod(TEMPInput.inputString, &ptr);
-//      strcpy(TEMPMeasurement.data, TEMPInput.inputString);
-//      getTimestamp(TEMPMeasurement.timestamp);
-//      TEMPMeasurement.waitingForData = false;
-//      TEMPMeasurement.measurementAcquired = true;
-//    }
-    resetInput(&TEMPInput);
+    TEMPInput.reset();
   }
 
-  if (ECInput.messageComplete) {               // Relay message received from EC probe
+  if(ECInput.messageComplete) {               // Relay message received from EC probe
     Serial.print(F("EC,")); Serial.println(ECInput.inputString);
     Serial.flush();
-//    if (ECMeasurement.waitingForData) {
-//      strcpy(ECMeasurement.data, ECInput.inputString);
-//      getTimestamp(ECMeasurement.timestamp);
-//      ECMeasurement.waitingForData = false;
-//      ECMeasurement.measurementAcquired = true;
-//    }
-    resetInput(&ECInput);
+    ECInput.reset();
   }
 
-  if (currentSettings.sleepEnabled) {
+  if(currentSettings.sleepEnabled) {
     unsigned long currentTime = millis();
-    if (!currentSettings.measurementInterval || ((currentTime + 8700) > nextMeasureTime)) {  // Make sure the next 8 second sleep interval won't overrun the next measurement time.
-      if (!PCInput.messageBegun && !ECInput.messageBegun && !TEMPInput.messageBegun && !Serial.available() && !Serial2.available() && !Serial3.available()) {  // Make sure no one is trying to talk to the Arduino before going to sleep
+    if(!currentSettings.measurementInterval || ((currentTime + 8700) > nextMeasureTime)) {  // Make sure the next 8 second sleep interval won't overrun the next measurement time.
+      if(!PCInput.messageBegun && !ECInput.messageBegun && !TEMPInput.messageBegun && !Serial.available() && !Serial2.available() && !Serial3.available()) {  // Make sure no one is trying to talk to the Arduino before going to sleep
         /* Re-enter sleep mode. */
         goToSleep();  // Sleeps for 8 seconds or until a serial message is received from PC
       } else {
@@ -1441,6 +1435,6 @@ void loop() {
       }
     }
   } else {
-    delay(500); // busy wait if sleep is not enabled
+    delay(125); // busy wait if sleep is not enabled
   }
 }
